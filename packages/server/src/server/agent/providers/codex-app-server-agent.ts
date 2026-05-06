@@ -80,10 +80,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 const DEFAULT_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
 const TURN_START_TIMEOUT_MS = 90 * 1000;
 const INTERRUPT_TIMEOUT_MS = 2_000;
+const EXTERNAL_HISTORY_POLL_INTERVAL_MS = 2_000;
 const APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 2_000;
 const APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS = 1_000;
 const CODEX_PROVIDER = "codex" as const;
 const CODEX_IMAGE_ATTACHMENT_DIR = "paseo-attachments";
+const CODEX_DESKTOP_THREAD_SOURCE = "vscode";
 const ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN = "\n\n---\n\n";
 const CODEX_PLAN_IMPLEMENTATION_PROMPT_PREFIX =
   "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.";
@@ -1604,6 +1606,44 @@ const CodexThreadReadResponseSchema = z
 
 type CodexThreadReadResponse = z.infer<typeof CodexThreadReadResponseSchema>;
 type CodexThreadReadRequest = (threadId: string) => Promise<unknown>;
+type CodexThreadMemoryMode = "enabled" | "disabled";
+
+interface CodexThreadHistoryEntry {
+  key: string;
+  item: unknown;
+  timelineItem: AgentTimelineItem | null;
+}
+
+function buildCodexThreadHistoryItemKey(
+  item: unknown,
+  turnIndex: number,
+  itemIndex: number,
+): string {
+  const itemRecord = toObjectRecord(item);
+  if (itemRecord && typeof itemRecord.id === "string" && itemRecord.id.trim().length > 0) {
+    return itemRecord.id.trim();
+  }
+  return `${turnIndex}:${itemIndex}:${JSON.stringify(item)}`;
+}
+
+function extractCodexThreadHistoryEntries(params: {
+  response: CodexThreadReadResponse;
+  cwd: string | null;
+}): CodexThreadHistoryEntry[] {
+  const entries: CodexThreadHistoryEntry[] = [];
+  const turns = params.response.thread.turns ?? [];
+  for (const [turnIndex, turn] of turns.entries()) {
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    for (const [itemIndex, item] of items.entries()) {
+      entries.push({
+        key: buildCodexThreadHistoryItemKey(item, turnIndex, itemIndex),
+        item,
+        timelineItem: threadItemToTimeline(item, { cwd: params.cwd }),
+      });
+    }
+  }
+  return entries;
+}
 
 async function requestCodexThreadHistory(
   requestThread: CodexThreadReadRequest,
@@ -1619,16 +1659,12 @@ async function loadCodexThreadHistoryTimeline(params: {
   requestThread: CodexThreadReadRequest;
 }): Promise<AgentTimelineItem[]> {
   const response = await requestCodexThreadHistory(params.requestThread, params.threadId);
-  const timeline: AgentTimelineItem[] = [];
-  for (const turn of response.thread.turns) {
-    for (const item of turn.items) {
-      const timelineItem = threadItemToTimeline(item, { cwd: params.cwd });
-      if (timelineItem) {
-        timeline.push(timelineItem);
-      }
-    }
-  }
-  return timeline;
+  return extractCodexThreadHistoryEntries({
+    response,
+    cwd: params.cwd,
+  })
+    .map((entry) => entry.timelineItem)
+    .filter((item): item is AgentTimelineItem => item !== null);
 }
 
 function readCodexThread(client: CodexAppServerClient, threadId: string): Promise<unknown> {
@@ -1636,6 +1672,39 @@ function readCodexThread(client: CodexAppServerClient, threadId: string): Promis
     threadId,
     includeTurns: true,
   });
+}
+
+function readCodexThreadMetadata(client: CodexAppServerClient, threadId: string): Promise<unknown> {
+  return client.request("thread/read", {
+    threadId,
+    includeTurns: false,
+  });
+}
+
+async function readLatestCodexThreadMemoryMode(
+  rolloutPath: string,
+): Promise<CodexThreadMemoryMode | null> {
+  try {
+    const file = await fs.readFile(rolloutPath, "utf8");
+    const lines = file
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const record = toObjectRecord(JSON.parse(lines[index]));
+      if (record?.type !== "session_meta") {
+        continue;
+      }
+      const payload = toObjectRecord(record.payload);
+      const memoryMode = payload?.memory_mode;
+      if (memoryMode === "enabled" || memoryMode === "disabled") {
+        return memoryMode;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 function toSandboxPolicy(type: string, networkAccess?: boolean): Record<string, unknown> {
@@ -2637,7 +2706,11 @@ class CodexAppServerAgentSession implements AgentSession {
   private planModeEnabled = false;
   private historyPending = false;
   private persistedHistory: AgentTimelineItem[] = [];
+  private observedThreadHistoryKeys = new Set<string>();
+  private externalHistoryPollTimer: ReturnType<typeof setTimeout> | null = null;
+  private externalHistoryPollInFlight: Promise<void> | null = null;
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
+  private supportsThreadMemoryModeRepair: boolean | null = null;
   private pendingPermissionHandlers = new Map<
     string,
     {
@@ -2741,6 +2814,7 @@ class CodexAppServerAgentSession implements AgentSession {
     if (this.currentThreadId) {
       await this.ensureThreadLoaded();
       await this.loadPersistedHistory();
+      this.startExternalHistoryPolling();
     }
 
     this.connected = true;
@@ -2954,13 +3028,17 @@ class CodexAppServerAgentSession implements AgentSession {
     const threadId = this.currentThreadId;
 
     try {
-      const timeline = await loadCodexThreadHistoryTimeline({
-        threadId,
+      const response = await requestCodexThreadHistory((threadIdToRead) => {
+        return readCodexThread(client, threadIdToRead);
+      }, threadId);
+      const entries = extractCodexThreadHistoryEntries({
+        response,
         cwd: this.config.cwd ?? null,
-        requestThread: (threadIdToRead) => {
-          return readCodexThread(client, threadIdToRead);
-        },
       });
+      this.observedThreadHistoryKeys = new Set(entries.map((entry) => entry.key));
+      const timeline = entries
+        .map((entry) => entry.timelineItem)
+        .filter((item): item is AgentTimelineItem => item !== null);
       if (timeline.length > 0) {
         this.persistedHistory = timeline;
         this.historyPending = true;
@@ -2987,11 +3065,75 @@ class CodexAppServerAgentSession implements AgentSession {
         params.config = codexConfig;
       }
       await this.client.request("thread/resume", params);
+      this.startExternalHistoryPolling();
     } catch (error) {
       this.logger.warn({ error }, "Failed to resume Codex thread, starting new thread");
       this.currentThreadId = null;
       await this.ensureThread();
     }
+  }
+
+  private startExternalHistoryPolling(): void {
+    if (this.externalHistoryPollTimer || !this.currentThreadId) {
+      return;
+    }
+    this.scheduleExternalHistoryPoll();
+  }
+
+  private stopExternalHistoryPolling(): void {
+    if (this.externalHistoryPollTimer) {
+      clearTimeout(this.externalHistoryPollTimer);
+      this.externalHistoryPollTimer = null;
+    }
+  }
+
+  private scheduleExternalHistoryPoll(delayMs = EXTERNAL_HISTORY_POLL_INTERVAL_MS): void {
+    this.stopExternalHistoryPolling();
+    this.externalHistoryPollTimer = setTimeout(() => {
+      this.externalHistoryPollTimer = null;
+      this.externalHistoryPollInFlight = this.syncExternalThreadHistory({ emitNewItems: true })
+        .catch((error) => {
+          this.logger.trace({ error }, "External Codex thread sync failed");
+        })
+        .finally(() => {
+          this.externalHistoryPollInFlight = null;
+          if (this.connected && this.currentThreadId) {
+            this.scheduleExternalHistoryPoll();
+          }
+        });
+    }, delayMs);
+  }
+
+  private async syncExternalThreadHistory(options?: { emitNewItems?: boolean }): Promise<void> {
+    if (!this.client || !this.currentThreadId || this.activeForegroundTurnId) {
+      return;
+    }
+
+    const response = await requestCodexThreadHistory((threadIdToRead) => {
+      return readCodexThread(this.client!, threadIdToRead);
+    }, this.currentThreadId);
+    const entries = extractCodexThreadHistoryEntries({
+      response,
+      cwd: this.config.cwd ?? null,
+    });
+
+    if (options?.emitNewItems) {
+      for (const entry of entries) {
+        if (this.observedThreadHistoryKeys.has(entry.key)) {
+          continue;
+        }
+        this.observedThreadHistoryKeys.add(entry.key);
+        if (entry.timelineItem) {
+          this.emitEvent({
+            type: "timeline",
+            provider: CODEX_PROVIDER,
+            item: entry.timelineItem,
+          });
+        }
+      }
+    }
+
+    this.observedThreadHistoryKeys = new Set(entries.map((entry) => entry.key));
   }
 
   private parseSlashCommandInput(text: string): { commandName: string; args?: string } | null {
@@ -3457,6 +3599,10 @@ class CodexAppServerAgentSession implements AgentSession {
   }
 
   async close(): Promise<void> {
+    this.stopExternalHistoryPolling();
+    this.connected = false;
+    this.currentThreadId = null;
+    this.currentTurnId = null;
     for (const pending of this.pendingPermissionHandlers.values()) {
       pending.resolve({ decision: "cancel" });
     }
@@ -3468,10 +3614,11 @@ class CodexAppServerAgentSession implements AgentSession {
     if (this.client) {
       await this.client.dispose();
     }
+    if (this.externalHistoryPollInFlight) {
+      await this.externalHistoryPollInFlight.catch(() => undefined);
+    }
     this.client = null;
-    this.connected = false;
-    this.currentThreadId = null;
-    this.currentTurnId = null;
+    this.observedThreadHistoryKeys.clear();
   }
 
   async listCommands(): Promise<AgentSlashCommand[]> {
@@ -3967,6 +4114,7 @@ class CodexAppServerAgentSession implements AgentSession {
     parsed: Extract<ParsedCodexNotification, { kind: "thread_started" }>,
   ): void {
     this.currentThreadId = parsed.threadId;
+    this.startExternalHistoryPolling();
     this.emitEvent({
       type: "thread_started",
       provider: CODEX_PROVIDER,
@@ -4021,6 +4169,57 @@ class CodexAppServerAgentSession implements AgentSession {
     }
     this.activeForegroundTurnId = null;
     this.resetTurnTrackingState();
+    void this.syncExternalThreadHistory({ emitNewItems: false }).catch((error) => {
+      this.logger.trace({ error }, "Failed to refresh Codex thread history baseline");
+    });
+    if (parsed.status === "completed" && parsed.threadId) {
+      void this.repairCodexDesktopThreadIndex(parsed.threadId).catch((error) => {
+        this.logger.trace(
+          { error, threadId: parsed.threadId },
+          "Failed to repair Codex desktop thread index",
+        );
+      });
+    }
+  }
+
+  private async repairCodexDesktopThreadIndex(threadId: string): Promise<void> {
+    if (!this.client || this.supportsThreadMemoryModeRepair === false) {
+      return;
+    }
+
+    const response = toObjectRecord(await readCodexThreadMetadata(this.client, threadId));
+    const thread = toObjectRecord(response?.thread);
+    if (thread?.source !== CODEX_DESKTOP_THREAD_SOURCE) {
+      return;
+    }
+
+    const rolloutPath = typeof thread.path === "string" ? thread.path : null;
+    const memoryMode =
+      rolloutPath != null ? await readLatestCodexThreadMemoryMode(rolloutPath) : null;
+
+    try {
+      await this.client.request("thread/memoryMode/set", {
+        threadId,
+        mode: memoryMode ?? "enabled",
+      });
+      this.supportsThreadMemoryModeRepair = true;
+    } catch (error) {
+      const message = toDiagnosticErrorMessage(error).toLowerCase();
+      if (
+        message.includes("thread/memorymode/set") ||
+        message.includes("experimental_api") ||
+        message.includes("experimental api") ||
+        message.includes("unknown variant")
+      ) {
+        this.supportsThreadMemoryModeRepair = false;
+        this.logger.debug(
+          { error, threadId },
+          "Codex binary does not support desktop thread repair via memory mode RPC",
+        );
+        return;
+      }
+      throw error;
+    }
   }
 
   private resetTurnTrackingState(): void {
@@ -4721,13 +4920,27 @@ export class CodexAppServerAgentClient implements AgentClient {
       client.notify("initialized", {});
 
       const limit = options?.limit ?? 20;
-      const response = toObjectRecord(await client.request("thread/list", { limit }));
+      const response = toObjectRecord(
+        await client.request("thread/list", {
+          limit,
+          ...(options?.includeArchived ? { archived: true } : {}),
+        }),
+      );
       const threads = Array.isArray(response?.data) ? response.data : [];
       const descriptors: PersistedAgentDescriptor[] = await Promise.all(
         threads.slice(0, limit).map(async (thread) => {
           const threadId = typeof thread.id === "string" ? thread.id : "";
           const cwd = typeof thread.cwd === "string" ? thread.cwd : process.cwd();
-          const title = typeof thread.preview === "string" ? thread.preview : null;
+          const preview = typeof thread.preview === "string" ? thread.preview : null;
+          const threadName = typeof thread.name === "string" ? thread.name : null;
+          const title = threadName ?? preview;
+          const renamed =
+            typeof threadName === "string" &&
+            typeof preview === "string" &&
+            threadName.trim().length > 0 &&
+            threadName.trim() !== preview.trim();
+          const archivedAt =
+            typeof thread.archivedAt === "number" ? new Date(thread.archivedAt * 1000) : null;
           let timeline: AgentTimelineItem[] = [];
 
           try {
@@ -4752,6 +4965,7 @@ export class CodexAppServerAgentClient implements AgentClient {
                 (typeof thread.createdAt === "number" ? thread.createdAt : undefined) ??
                 0) * 1000,
             ),
+            archivedAt,
             persistence: {
               provider: CODEX_PROVIDER,
               sessionId: threadId,
@@ -4760,6 +4974,9 @@ export class CodexAppServerAgentClient implements AgentClient {
                 provider: CODEX_PROVIDER,
                 cwd,
                 title,
+                preview,
+                threadName,
+                renamed,
                 threadId,
               },
             },

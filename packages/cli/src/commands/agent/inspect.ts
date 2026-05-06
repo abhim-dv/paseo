@@ -19,6 +19,7 @@ interface AgentInspect {
   Status: string;
   Archived: boolean;
   ArchivedAt: string | null;
+  RenamedOnDesktop: boolean | null;
   Mode: string;
   Cwd: string;
   CreatedAt: string;
@@ -124,6 +125,14 @@ function buildCapabilities(snapshot: AgentSnapshotPayload): AgentInspect["Capabi
   };
 }
 
+function resolveRenamedOnDesktop(snapshot: AgentSnapshotPayload): boolean | null {
+  if (snapshot.provider !== "codex") {
+    return null;
+  }
+  const renamed = snapshot.persistence?.metadata?.["renamed"];
+  return typeof renamed === "boolean" ? renamed : null;
+}
+
 /** Convert agent snapshot to inspection data */
 function toInspectData(snapshot: AgentSnapshotPayload): AgentInspect {
   return {
@@ -135,6 +144,7 @@ function toInspectData(snapshot: AgentSnapshotPayload): AgentInspect {
     Status: snapshot.status,
     Archived: snapshot.archivedAt != null,
     ArchivedAt: snapshot.archivedAt ?? null,
+    RenamedOnDesktop: resolveRenamedOnDesktop(snapshot),
     Mode: snapshot.currentModeId ?? "default",
     Cwd: snapshot.cwd,
     CreatedAt: snapshot.createdAt,
@@ -164,6 +174,10 @@ function toInspectRows(agent: AgentInspect): InspectRow[] {
     { key: "Status", value: agent.Status },
     { key: "Archived", value: String(agent.Archived) },
     { key: "ArchivedAt", value: agent.ArchivedAt ?? "null" },
+    {
+      key: "RenamedOnDesktop",
+      value: agent.RenamedOnDesktop == null ? "null" : String(agent.RenamedOnDesktop),
+    },
     { key: "Mode", value: agent.Mode },
     { key: "Cwd", value: shortenPath(agent.Cwd) },
     { key: "CreatedAt", value: agent.CreatedAt },

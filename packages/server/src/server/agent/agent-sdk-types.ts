@@ -427,6 +427,7 @@ export interface AgentSlashCommand {
 
 export interface ListPersistedAgentsOptions {
   limit?: number;
+  includeArchived?: boolean;
 }
 
 export interface PersistedAgentDescriptor {
@@ -435,6 +436,7 @@ export interface PersistedAgentDescriptor {
   cwd: string;
   title: string | null;
   lastActivityAt: Date;
+  archivedAt?: Date | null;
   persistence: AgentPersistenceHandle;
   timeline: AgentTimelineItem[];
 }

@@ -32,6 +32,8 @@ interface CodexSessionTestAccess {
   handleToolApprovalRequest(params: unknown): Promise<unknown>;
   handleNotification(method: string, params: unknown): void;
   loadPersistedHistory(): Promise<void>;
+  syncExternalThreadHistory(options?: { emitNewItems?: boolean }): Promise<void>;
+  repairCodexDesktopThreadIndex(threadId: string): Promise<void>;
   refreshResolvedCollaborationMode(): void;
   serviceTier: "fast" | null;
   planModeEnabled: boolean;
@@ -876,6 +878,196 @@ describe("Codex app-server provider", () => {
           text: "History loaded.",
         },
       },
+    ]);
+  });
+
+  test("emits externally-added Codex thread items during sync", async () => {
+    const session = createSession();
+    session.activeForegroundTurnId = null;
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    let readCount = 0;
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method !== "thread/read") {
+          return {};
+        }
+        readCount += 1;
+        if (readCount === 1) {
+          return {
+            thread: {
+              turns: [
+                {
+                  items: [{ type: "agentMessage", id: "message-history", text: "History loaded." }],
+                },
+              ],
+            },
+          };
+        }
+        return {
+          thread: {
+            turns: [
+              {
+                items: [{ type: "agentMessage", id: "message-history", text: "History loaded." }],
+              },
+              {
+                items: [
+                  {
+                    type: "userMessage",
+                    id: "user-external-1",
+                    content: [{ type: "text", text: "Desktop says hello" }],
+                  },
+                  { type: "agentMessage", id: "assistant-external-1", text: "hello back" },
+                ],
+              },
+            ],
+          },
+        };
+      }),
+    };
+
+    await asInternals(session).loadPersistedHistory();
+    for await (const _event of session.streamHistory()) {
+      // drain baseline history
+    }
+
+    await asInternals(session).syncExternalThreadHistory({ emitNewItems: true });
+
+    expect(events).toEqual([
+      {
+        type: "timeline",
+        provider: "codex",
+        item: {
+          type: "user_message",
+          text: "Desktop says hello",
+        },
+      },
+      {
+        type: "timeline",
+        provider: "codex",
+        item: {
+          type: "assistant_message",
+          text: "hello back",
+        },
+      },
+    ]);
+  });
+
+  test("does not re-emit already observed external Codex thread items", async () => {
+    const session = createSession();
+    session.activeForegroundTurnId = null;
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method !== "thread/read") {
+          return {};
+        }
+        return {
+          thread: {
+            turns: [
+              {
+                items: [{ type: "agentMessage", id: "message-history", text: "History loaded." }],
+              },
+              {
+                items: [
+                  {
+                    type: "userMessage",
+                    id: "user-external-1",
+                    content: [{ type: "text", text: "Desktop says hello" }],
+                  },
+                  { type: "agentMessage", id: "assistant-external-1", text: "hello back" },
+                ],
+              },
+            ],
+          },
+        };
+      }),
+    };
+
+    await asInternals(session).loadPersistedHistory();
+    for await (const _event of session.streamHistory()) {
+      // drain baseline history
+    }
+
+    await asInternals(session).syncExternalThreadHistory({ emitNewItems: true });
+    events.length = 0;
+    await asInternals(session).syncExternalThreadHistory({ emitNewItems: true });
+
+    expect(events).toEqual([]);
+  });
+
+  test("repairs Codex desktop-backed threads via memory mode RPC", async () => {
+    const session = createSession();
+    const requests: Array<{ method: string; params: unknown }> = [];
+    const tempRoot = await mkdtemp(path.join(tmpdir(), "codex-memory-mode-repair-"));
+    const rolloutPath = path.join(tempRoot, "rollout.jsonl");
+    writeFileSync(
+      rolloutPath,
+      [
+        JSON.stringify({
+          type: "session_meta",
+          payload: {
+            id: "test-thread",
+            source: "vscode",
+            memory_mode: "disabled",
+          },
+        }),
+      ].join("\n"),
+      "utf8",
+    );
+
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        requests.push({ method, params });
+        if (method === "thread/read") {
+          return {
+            thread: {
+              id: "test-thread",
+              source: "vscode",
+              path: rolloutPath,
+              turns: [],
+            },
+          };
+        }
+        return {};
+      }),
+    };
+
+    await asInternals(session).repairCodexDesktopThreadIndex("test-thread");
+
+    expect(requests).toEqual([
+      { method: "thread/read", params: { threadId: "test-thread", includeTurns: false } },
+      {
+        method: "thread/memoryMode/set",
+        params: { threadId: "test-thread", mode: "disabled" },
+      },
+    ]);
+  });
+
+  test("skips desktop repair for non-desktop Codex threads", async () => {
+    const session = createSession();
+    const requests: Array<{ method: string; params: unknown }> = [];
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        requests.push({ method, params });
+        return {
+          thread: {
+            id: "test-thread",
+            source: "app-server",
+            path: null,
+            turns: [],
+          },
+        };
+      }),
+    };
+
+    await asInternals(session).repairCodexDesktopThreadIndex("test-thread");
+
+    expect(requests).toEqual([
+      { method: "thread/read", params: { threadId: "test-thread", includeTurns: false } },
     ]);
   });
 

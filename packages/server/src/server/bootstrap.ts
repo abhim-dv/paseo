@@ -98,6 +98,7 @@ import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
+import { syncCodexPersistedAgents } from "./codex-auto-import.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
 import {
   buildProviderRegistry,
@@ -478,6 +479,23 @@ export async function createPaseoDaemon(
     logger,
   });
   logger.info({ elapsed: elapsed() }, "Workspace registries bootstrapped");
+  void syncCodexPersistedAgents({
+    agentManager,
+    agentStorage,
+    projectRegistry,
+    workspaceRegistry,
+    workspaceGitService,
+    logger,
+  })
+    .then((autoImportResult) => {
+      return logger.info(
+        { elapsed: elapsed(), ...autoImportResult },
+        "Codex auto-import sync completed",
+      );
+    })
+    .catch((error) => {
+      logger.warn({ err: error, elapsed: elapsed() }, "Codex auto-import sync failed");
+    });
   await chatService.initialize();
   logger.info({ elapsed: elapsed() }, "Chat service initialized");
   const checkoutDiffManager = new CheckoutDiffManager({

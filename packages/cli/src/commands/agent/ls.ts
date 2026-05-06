@@ -31,8 +31,9 @@ export interface AgentListItem {
   provider: string;
   thinking: string;
   status: string;
+  archived: string;
   cwd: string;
-  created: string;
+  updated: string;
 }
 
 /** Helper to get relative time string */
@@ -82,8 +83,9 @@ export const agentLsSchema: OutputSchema<AgentListItem> = {
         return undefined;
       },
     },
+    { header: "ARCHIVED", field: "archived", width: 10 },
     { header: "CWD", field: "cwd", width: 30 },
-    { header: "CREATED", field: "created", width: 15 },
+    { header: "UPDATED", field: "updated", width: 15 },
   ],
 };
 
@@ -97,8 +99,9 @@ function toListItem(agent: AgentSnapshotPayload): AgentListItem {
     provider: model ? `${agent.provider}/${model}` : agent.provider,
     thinking: agent.effectiveThinkingOptionId ?? "auto",
     status: agent.status,
+    archived: agent.archivedAt ? "yes" : "no",
     cwd: shortenPath(agent.cwd),
-    created: relativeTime(agent.createdAt),
+    updated: relativeTime(agent.updatedAt),
   };
 }
 
@@ -226,20 +229,6 @@ export async function runLsCommand(
     }
 
     await client.close();
-
-    // Sort agents: running first, then idle, then others; within each group, most recent first
-    const statusOrder = { running: 0, idle: 1 } as Record<string, number>;
-    agents.sort((a, b) => {
-      // Primary sort: by status
-      const aOrder = statusOrder[a.status] ?? 999;
-      const bOrder = statusOrder[b.status] ?? 999;
-      if (aOrder !== bOrder) return aOrder - bOrder;
-
-      // Secondary sort: by creation time (most recent first)
-      const aTime = new Date(a.createdAt).getTime();
-      const bTime = new Date(b.createdAt).getTime();
-      return bTime - aTime;
-    });
 
     const items = agents.map(toListItem);
 
