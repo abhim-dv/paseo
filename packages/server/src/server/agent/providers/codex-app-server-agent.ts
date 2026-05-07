@@ -1707,6 +1707,27 @@ async function readLatestCodexThreadMemoryMode(
   return null;
 }
 
+function normalizeCodexSessionIndexThreadName(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+async function appendCodexSessionIndexEntry(
+  threadId: string,
+  threadName: string,
+): Promise<void> {
+  const sessionIndexPath = path.join(resolveCodexHomeDir(), "session_index.jsonl");
+  const entry = JSON.stringify({
+    id: threadId,
+    thread_name: threadName,
+    updated_at: new Date().toISOString(),
+  });
+  await fs.appendFile(sessionIndexPath, `${entry}\n`, "utf8");
+}
+
 function toSandboxPolicy(type: string, networkAccess?: boolean): Record<string, unknown> {
   switch (type) {
     case "read-only":
@@ -4194,6 +4215,9 @@ class CodexAppServerAgentSession implements AgentSession {
     }
 
     const rolloutPath = typeof thread.path === "string" ? thread.path : null;
+    const threadName =
+      normalizeCodexSessionIndexThreadName(thread.name) ??
+      normalizeCodexSessionIndexThreadName(thread.preview);
     const memoryMode =
       rolloutPath != null ? await readLatestCodexThreadMemoryMode(rolloutPath) : null;
 
@@ -4203,6 +4227,9 @@ class CodexAppServerAgentSession implements AgentSession {
         mode: memoryMode ?? "enabled",
       });
       this.supportsThreadMemoryModeRepair = true;
+      if (threadName) {
+        await appendCodexSessionIndexEntry(threadId, threadName);
+      }
     } catch (error) {
       const message = toDiagnosticErrorMessage(error).toLowerCase();
       if (

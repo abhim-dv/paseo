@@ -28,6 +28,7 @@ interface MockProviderOptions {
   description?: string;
   defaultModeId?: string | null;
   modes?: AgentMode[];
+  lazyDiscovery?: boolean;
   isAvailable?: () => Promise<boolean>;
   fetchModels?: (cwd: string, force: boolean) => Promise<AgentModelDefinition[]>;
   fetchModes?: (cwd: string, force: boolean) => Promise<AgentMode[]>;
@@ -141,6 +142,67 @@ describe("ProviderSnapshotManager", () => {
       defaultModeId: null,
     });
     expect(getProviderEntry(snapshot, "codex")?.fetchedAt).toEqual(expect.any(String));
+
+    manager.destroy();
+  });
+
+  test("lazy discovery providers are not probed during automatic snapshot warm-up", async () => {
+    const { registry, handles } = createRegistry([
+      createMockProvider({
+        provider: "codex",
+        fetchModels: async () => [createModel("codex", "gpt-5.2")],
+      }),
+      createMockProvider({
+        provider: "opencode",
+        lazyDiscovery: true,
+        fetchModels: async () => [createModel("opencode", "glm")],
+      }),
+    ]);
+    const manager = new ProviderSnapshotManager(registry, createTestLogger());
+
+    manager.getSnapshot(projectCwd);
+
+    await vi.waitFor(() => {
+      expect(getProviderEntry(manager.getSnapshot(projectCwd), "codex")?.status).toBe("ready");
+    });
+
+    const opencodeEntry = getProviderEntry(manager.getSnapshot(projectCwd), "opencode");
+    expect(opencodeEntry).toMatchObject({
+      provider: "opencode",
+      status: "unavailable",
+      enabled: true,
+      error: "Provider discovery is deferred until this provider is selected.",
+    });
+    expect(handles.opencode?.isAvailable).not.toHaveBeenCalled();
+    expect(handles.opencode?.fetchModels).not.toHaveBeenCalled();
+    expect(handles.opencode?.fetchModes).not.toHaveBeenCalled();
+
+    manager.destroy();
+  });
+
+  test("explicit refresh probes lazy discovery providers", async () => {
+    const { registry, handles } = createRegistry([
+      createMockProvider({
+        provider: "opencode",
+        lazyDiscovery: true,
+        fetchModels: async () => [createModel("opencode", "glm")],
+        fetchModes: async () => [createMode("build")],
+      }),
+    ]);
+    const manager = new ProviderSnapshotManager(registry, createTestLogger());
+
+    manager.getSnapshot(projectCwd);
+    await manager.refreshSnapshotForCwd({ cwd: projectCwd, providers: ["opencode"] });
+
+    expect(handles.opencode?.isAvailable).toHaveBeenCalledTimes(1);
+    expect(handles.opencode?.fetchModels).toHaveBeenCalledTimes(1);
+    expect(handles.opencode?.fetchModes).toHaveBeenCalledTimes(1);
+    expect(getProviderEntry(manager.getSnapshot(projectCwd), "opencode")).toMatchObject({
+      provider: "opencode",
+      status: "ready",
+      models: [createModel("opencode", "glm")],
+      modes: [createMode("build")],
+    });
 
     manager.destroy();
   });
@@ -1298,6 +1360,7 @@ function createMockProvider(options: MockProviderOptions): MockProviderHandle {
     description: options.description ?? `${options.provider} test provider`,
     defaultModeId: options.defaultModeId ?? null,
     modes: options.modes ?? [],
+    lazyDiscovery: options.lazyDiscovery,
     createClient: () => {
       createClient();
       return {

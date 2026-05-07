@@ -10,6 +10,7 @@ import type { ProviderDefinition } from "./provider-registry.js";
 
 const DEFAULT_SNAPSHOT_TTL_MS = 300_000;
 const DEFAULT_REFRESH_TIMEOUT_MS = 30_000;
+const LAZY_DISCOVERY_MESSAGE = "Provider discovery is deferred until this provider is selected.";
 
 type ProviderSnapshotChangeListener = (entries: ProviderSnapshotEntry[], cwd: string) => void;
 interface ProviderSnapshotManagerOptions {
@@ -81,9 +82,10 @@ export class ProviderSnapshotManager {
   async refreshSnapshotForCwd(options: ProviderSnapshotRefreshOptions): Promise<void> {
     const snapshotCwd = resolveGlobalSnapshotCwd();
     const providers = this.resolveRefreshProviders(options.providers);
+    const providersToRefresh = providers ?? this.getEagerProviderIds();
     this.resetSnapshotToLoading(snapshotCwd, providers);
     this.emitChange(snapshotCwd);
-    await this.refreshProviders(snapshotCwd, providers ?? this.getProviderIds());
+    await this.refreshProviders(snapshotCwd, providersToRefresh);
     if (!providers) {
       this.lastCheckedAts.set(snapshotCwd, this.now());
     }
@@ -94,7 +96,7 @@ export class ProviderSnapshotManager {
   ): Promise<void> {
     const homeCwd = resolveGlobalSnapshotCwd();
     const providers = this.resolveRefreshProviders(options.providers);
-    const providersToRefresh = providers ?? this.getProviderIds();
+    const providersToRefresh = providers ?? this.getEagerProviderIds();
 
     this.resetSnapshotToLoading(homeCwd, providers);
     this.emitChange(homeCwd);
@@ -162,10 +164,12 @@ export class ProviderSnapshotManager {
     const entries = new Map<AgentProvider, ProviderSnapshotEntry>();
     for (const provider of this.getProviderIds()) {
       const definition = this.providerRegistry[provider];
+      const lazyDiscovery = definition?.lazyDiscovery === true;
       entries.set(provider, {
         provider,
-        status: "loading",
+        status: lazyDiscovery ? "unavailable" : "loading",
         enabled: definition?.enabled ?? true,
+        ...(lazyDiscovery ? { error: LAZY_DISCOVERY_MESSAGE } : {}),
         label: definition?.label,
         description: definition?.description,
         defaultModeId: definition?.defaultModeId ?? null,
@@ -175,7 +179,7 @@ export class ProviderSnapshotManager {
   }
 
   private async warmUp(cwd: string, providers?: AgentProvider[]): Promise<void> {
-    const providersToRefresh = providers ?? this.getProviderIds();
+    const providersToRefresh = providers ?? this.getEagerProviderIds();
 
     await this.loadProviders({
       cwd,
@@ -378,8 +382,10 @@ export class ProviderSnapshotManager {
       const loadingEntry = loadingEntries.get(provider);
       if (!loadingEntry) continue;
       const existing = snapshot.get(provider);
+      const { error: _deferredError, ...entryWithoutError } = loadingEntry;
       snapshot.set(provider, {
-        ...loadingEntry,
+        ...entryWithoutError,
+        status: "loading",
         models: existing?.models,
         modes: existing?.modes,
         fetchedAt: existing?.fetchedAt,
@@ -390,6 +396,12 @@ export class ProviderSnapshotManager {
 
   private getProviderIds(): AgentProvider[] {
     return Object.keys(this.providerRegistry);
+  }
+
+  private getEagerProviderIds(): AgentProvider[] {
+    return this.getProviderIds().filter(
+      (provider) => this.providerRegistry[provider]?.lazyDiscovery !== true,
+    );
   }
 
   private resolveRefreshProviders(providers?: AgentProvider[]): AgentProvider[] | undefined {

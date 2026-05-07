@@ -23,6 +23,7 @@ export interface AgentProviderDefinition {
   description: string;
   defaultModeId: string | null;
   modes: AgentProviderModeDefinition[];
+  lazyDiscovery?: boolean;
   voice?: {
     enabled: boolean;
     defaultModeId: string;
@@ -178,6 +179,7 @@ export const AGENT_PROVIDER_DEFINITIONS: AgentProviderDefinition[] = [
     description: "Open-source coding assistant with multi-provider model support",
     defaultModeId: "build",
     modes: OPENCODE_MODES,
+    lazyDiscovery: true,
     voice: {
       enabled: true,
       defaultModeId: "build",

@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -1004,6 +1004,8 @@ describe("Codex app-server provider", () => {
     const requests: Array<{ method: string; params: unknown }> = [];
     const tempRoot = await mkdtemp(path.join(tmpdir(), "codex-memory-mode-repair-"));
     const rolloutPath = path.join(tempRoot, "rollout.jsonl");
+    const originalCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = tempRoot;
     writeFileSync(
       rolloutPath,
       [
@@ -1019,32 +1021,52 @@ describe("Codex app-server provider", () => {
       "utf8",
     );
 
-    session.client = {
-      request: vi.fn(async (method: string, params: unknown) => {
-        requests.push({ method, params });
-        if (method === "thread/read") {
-          return {
-            thread: {
-              id: "test-thread",
-              source: "vscode",
-              path: rolloutPath,
-              turns: [],
-            },
-          };
-        }
-        return {};
-      }),
-    };
+    try {
+      session.client = {
+        request: vi.fn(async (method: string, params: unknown) => {
+          requests.push({ method, params });
+          if (method === "thread/read") {
+            return {
+              thread: {
+                id: "test-thread",
+                source: "vscode",
+                path: rolloutPath,
+                preview: "Desktop-visible test thread",
+                turns: [],
+              },
+            };
+          }
+          return {};
+        }),
+      };
 
-    await asInternals(session).repairCodexDesktopThreadIndex("test-thread");
+      await asInternals(session).repairCodexDesktopThreadIndex("test-thread");
 
-    expect(requests).toEqual([
-      { method: "thread/read", params: { threadId: "test-thread", includeTurns: false } },
-      {
-        method: "thread/memoryMode/set",
-        params: { threadId: "test-thread", mode: "disabled" },
-      },
-    ]);
+      expect(requests).toEqual([
+        { method: "thread/read", params: { threadId: "test-thread", includeTurns: false } },
+        {
+          method: "thread/memoryMode/set",
+          params: { threadId: "test-thread", mode: "disabled" },
+        },
+      ]);
+      const sessionIndexPath = path.join(tempRoot, "session_index.jsonl");
+      const sessionIndexLines = readFileSync(sessionIndexPath, "utf8")
+        .trim()
+        .split(/\r?\n/)
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line));
+      expect(sessionIndexLines).toHaveLength(1);
+      expect(sessionIndexLines[0]).toMatchObject({
+        id: "test-thread",
+        thread_name: "Desktop-visible test thread",
+      });
+    } finally {
+      if (originalCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = originalCodexHome;
+      }
+    }
   });
 
   test("skips desktop repair for non-desktop Codex threads", async () => {
