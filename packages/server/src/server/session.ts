@@ -502,6 +502,54 @@ interface WorkspaceUpdatesSubscriptionState {
   lastEmittedByWorkspaceId: Map<string, WorkspaceUpdatePayload>;
 }
 
+export interface ClientActivitySnapshot {
+  deviceType: "web" | "mobile";
+  focusedAgentId: string | null;
+  lastActivityAt: Date;
+  appVisible: boolean;
+  appVisibilityChangedAt: Date;
+}
+
+export function shouldStartMobileSnapshotCatchup(input: {
+  previous: ClientActivitySnapshot | null;
+  next: ClientActivitySnapshot;
+}): boolean {
+  const { previous, next } = input;
+  if (next.deviceType !== "mobile" || !next.appVisible || !next.focusedAgentId) {
+    return false;
+  }
+  if (!previous || previous.deviceType !== "mobile") {
+    return true;
+  }
+  return !previous.appVisible || previous.focusedAgentId !== next.focusedAgentId;
+}
+
+export function shouldForceMobileSnapshotTimelineFetch(input: {
+  activity: ClientActivitySnapshot | null;
+  agentId: string;
+  expiresAtMs: number | undefined;
+  nowMs: number;
+}): boolean {
+  const { activity, agentId, expiresAtMs, nowMs } = input;
+  if (!activity || activity.deviceType !== "mobile" || !activity.appVisible) {
+    return false;
+  }
+  if (activity.focusedAgentId !== agentId) {
+    return false;
+  }
+  return expiresAtMs !== undefined && expiresAtMs > nowMs;
+}
+
+interface AgentTimelineFetchPlan {
+  forceMobileSnapshot: boolean;
+  direction: AgentTimelineFetchDirection;
+  projection: TimelineProjectionMode;
+  requestedLimit: number | undefined;
+  limit: number | undefined;
+  shouldLimitByProjectedWindow: boolean;
+  cursor: AgentTimelineCursor | undefined;
+}
+
 class SessionRequestError extends Error {
   constructor(
     readonly code: string,
@@ -806,14 +854,10 @@ export class Session {
   private unsubscribeAgentEvents: (() => void) | null = null;
   private agentUpdatesSubscription: AgentUpdatesSubscriptionState | null = null;
   private workspaceUpdatesSubscription: WorkspaceUpdatesSubscriptionState | null = null;
-  private clientActivity: {
-    deviceType: "web" | "mobile";
-    focusedAgentId: string | null;
-    lastActivityAt: Date;
-    appVisible: boolean;
-    appVisibilityChangedAt: Date;
-  } | null = null;
+  private clientActivity: ClientActivitySnapshot | null = null;
+  private readonly mobileSnapshotCatchupUntilByAgentId = new Map<string, number>();
   private readonly MOBILE_BACKGROUND_STREAM_GRACE_MS = 60_000;
+  private readonly MOBILE_SNAPSHOT_CATCHUP_WINDOW_MS = 10_000;
   private readonly terminalManager: TerminalManager | null;
   private readonly providerSnapshotManager: ProviderSnapshotManager | null;
   private unsubscribeProviderSnapshotEvents: (() => void) | null = null;
@@ -1016,6 +1060,28 @@ export class Session {
 
   async emitWorkspaceUpdatesForExternalCwds(cwds: Iterable<string>): Promise<void> {
     await Promise.all(Array.from(cwds, (cwd) => this.emitWorkspaceUpdateForCwd(cwd)));
+  }
+
+  async emitStoredAgentUpdatesForExternalMutation(input: {
+    upsertAgentIds: Iterable<string>;
+    removeAgentIds: Iterable<string>;
+    cwds: Iterable<string>;
+  }): Promise<void> {
+    const subscription = this.agentUpdatesSubscription;
+    if (subscription) {
+      for (const agentId of input.removeAgentIds) {
+        this.bufferOrEmitAgentUpdate(subscription, {
+          kind: "remove",
+          agentId,
+        });
+      }
+
+      for (const agentId of input.upsertAgentIds) {
+        await this.emitStoredAgentUpdateForExternalMutation(agentId, subscription);
+      }
+    }
+
+    await this.emitWorkspaceUpdatesForExternalCwds(input.cwds);
   }
 
   async warmWorkspaceGitDataForWorkspace(workspace: PersistedWorkspaceRecord): Promise<void> {
@@ -1674,6 +1740,52 @@ export class Session {
     } catch (error) {
       this.sessionLogger.error({ err: error }, "Failed to emit agent update");
     }
+  }
+
+  private async emitStoredAgentUpdateForExternalMutation(
+    agentId: string,
+    subscription: AgentUpdatesSubscriptionState,
+  ): Promise<void> {
+    const record = await this.agentStorage.get(agentId);
+    if (!record || record.internal) {
+      this.bufferOrEmitAgentUpdate(subscription, {
+        kind: "remove",
+        agentId,
+      });
+      return;
+    }
+
+    const payload = this.buildStoredAgentPayload(record);
+    const project = await this.buildProjectPlacementForCwd(payload.cwd, {
+      refreshGit: false,
+      fallback: true,
+    });
+    if (!project) {
+      this.bufferOrEmitAgentUpdate(subscription, {
+        kind: "remove",
+        agentId,
+      });
+      return;
+    }
+
+    const matches = this.matchesAgentFilter({
+      agent: payload,
+      project,
+      filter: subscription.filter,
+    });
+    this.bufferOrEmitAgentUpdate(
+      subscription,
+      matches
+        ? {
+            kind: "upsert",
+            agent: payload,
+            project,
+          }
+        : {
+            kind: "remove",
+            agentId,
+          },
+    );
   }
 
   /**
@@ -4300,13 +4412,22 @@ export class Session {
     const appVisibilityChangedAt = msg.appVisibilityChangedAt
       ? new Date(msg.appVisibilityChangedAt)
       : new Date(msg.lastActivityAt);
-    this.clientActivity = {
+    const previous = this.clientActivity;
+    const next: ClientActivitySnapshot = {
       deviceType: msg.deviceType,
       focusedAgentId: msg.focusedAgentId,
       lastActivityAt: new Date(msg.lastActivityAt),
       appVisible: msg.appVisible,
       appVisibilityChangedAt,
     };
+    this.clientActivity = next;
+
+    if (shouldStartMobileSnapshotCatchup({ previous, next }) && next.focusedAgentId) {
+      this.mobileSnapshotCatchupUntilByAgentId.set(
+        next.focusedAgentId,
+        Date.now() + this.MOBILE_SNAPSHOT_CATCHUP_WINDOW_MS,
+      );
+    }
   }
 
   /**
@@ -6407,6 +6528,55 @@ export class Session {
     return result;
   }
 
+  private shouldForceMobileSnapshotTimelineFetch(agentId: string): boolean {
+    const expiresAtMs = this.mobileSnapshotCatchupUntilByAgentId.get(agentId);
+    const nowMs = Date.now();
+    const shouldForce = shouldForceMobileSnapshotTimelineFetch({
+      activity: this.clientActivity,
+      agentId,
+      expiresAtMs,
+      nowMs,
+    });
+    if (expiresAtMs !== undefined && expiresAtMs <= nowMs) {
+      this.mobileSnapshotCatchupUntilByAgentId.delete(agentId);
+    }
+    return shouldForce;
+  }
+
+  private resolveAgentTimelineFetchPlan(
+    msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
+  ): AgentTimelineFetchPlan {
+    const forceMobileSnapshot = this.shouldForceMobileSnapshotTimelineFetch(msg.agentId);
+    const direction: AgentTimelineFetchDirection = forceMobileSnapshot
+      ? "tail"
+      : (msg.direction ?? (msg.cursor ? "after" : "tail"));
+    const projection: TimelineProjectionMode = msg.projection ?? "projected";
+    const requestedLimit = msg.limit;
+    const limit = requestedLimit ?? (direction === "after" ? 0 : undefined);
+    const shouldLimitByProjectedWindow =
+      projection === "canonical" &&
+      direction === "tail" &&
+      typeof requestedLimit === "number" &&
+      requestedLimit > 0;
+    const cursor: AgentTimelineCursor | undefined =
+      !forceMobileSnapshot && msg.cursor
+        ? {
+            epoch: msg.cursor.epoch,
+            seq: msg.cursor.seq,
+          }
+        : undefined;
+
+    return {
+      forceMobileSnapshot,
+      direction,
+      projection,
+      requestedLimit,
+      limit,
+      shouldLimitByProjectedWindow,
+      cursor,
+    };
+  }
+
   private async archiveWorkspaceRecord(workspaceId: string, archivedAt?: string): Promise<void> {
     const existingWorkspace = await archivePersistedWorkspaceRecord({
       workspaceId,
@@ -7159,21 +7329,9 @@ export class Session {
   private async handleFetchAgentTimelineRequest(
     msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
   ): Promise<void> {
-    const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
-    const projection: TimelineProjectionMode = msg.projection ?? "projected";
-    const requestedLimit = msg.limit;
-    const limit = requestedLimit ?? (direction === "after" ? 0 : undefined);
-    const shouldLimitByProjectedWindow =
-      projection === "canonical" &&
-      direction === "tail" &&
-      typeof requestedLimit === "number" &&
-      requestedLimit > 0;
-    const cursor: AgentTimelineCursor | undefined = msg.cursor
-      ? {
-          epoch: msg.cursor.epoch,
-          seq: msg.cursor.seq,
-        }
-      : undefined;
+    const plan = this.resolveAgentTimelineFetchPlan(msg);
+    const { direction, projection, requestedLimit, limit, shouldLimitByProjectedWindow, cursor } =
+      plan;
 
     try {
       const snapshot = await ensureAgentLoaded(msg.agentId, {
@@ -7191,13 +7349,23 @@ export class Session {
             ? Math.max(1, Math.floor(requestedLimit))
             : limit,
       });
+      if (plan.forceMobileSnapshot) {
+        timeline = {
+          ...timeline,
+          direction: "tail",
+          reset: true,
+          staleCursor: false,
+          gap: false,
+          hasNewer: false,
+        };
+      }
       let hasOlder = timeline.hasOlder;
       let hasNewer = timeline.hasNewer;
       let startCursor: { epoch: string; seq: number } | null = null;
       let endCursor: { epoch: string; seq: number } | null = null;
       let entries: ReturnType<typeof projectTimelineRows>;
 
-      if (shouldLimitByProjectedWindow) {
+      if (shouldLimitByProjectedWindow && typeof requestedLimit === "number") {
         const projectedResult = this.loadProjectedTimelineWindow({
           agentId: msg.agentId,
           direction,

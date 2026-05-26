@@ -145,11 +145,13 @@ export async function syncCodexPersistedAgents(
   const descriptors = await options.agentManager.listPersistedAgents({
     provider: "codex",
     limit,
+    includeTimeline: false,
   });
   const archivedOnlyDescriptors = await options.agentManager.listPersistedAgents({
     provider: "codex",
     limit,
     includeArchived: true,
+    includeTimeline: false,
   });
   const allDescriptorsByKey = new Map<string, PersistedAgentDescriptor>();
   for (const descriptor of [...descriptors, ...archivedOnlyDescriptors]) {
@@ -405,7 +407,7 @@ export async function syncCodexPersistedAgents(
         displayName: entry.membership.projectName,
         createdAt,
         updatedAt,
-        archivedAt: existing?.archivedAt ?? null,
+        archivedAt: null,
       }),
     );
   }
@@ -424,7 +426,7 @@ export async function syncCodexPersistedAgents(
         displayName: entry.membership.workspaceDisplayName,
         createdAt,
         updatedAt,
-        archivedAt: existing?.archivedAt ?? null,
+        archivedAt: null,
       }),
     );
   }

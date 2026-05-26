@@ -1715,10 +1715,7 @@ function normalizeCodexSessionIndexThreadName(value: unknown): string | null {
   return normalized.length > 0 ? normalized : null;
 }
 
-async function appendCodexSessionIndexEntry(
-  threadId: string,
-  threadName: string,
-): Promise<void> {
+async function appendCodexSessionIndexEntry(threadId: string, threadName: string): Promise<void> {
   const sessionIndexPath = path.join(resolveCodexHomeDir(), "session_index.jsonl");
   const entry = JSON.stringify({
     id: threadId,
@@ -4970,16 +4967,18 @@ export class CodexAppServerAgentClient implements AgentClient {
             typeof thread.archivedAt === "number" ? new Date(thread.archivedAt * 1000) : null;
           let timeline: AgentTimelineItem[] = [];
 
-          try {
-            timeline = await loadCodexThreadHistoryTimeline({
-              threadId,
-              cwd,
-              requestThread: (threadIdToRead) => {
-                return readCodexThread(client, threadIdToRead);
-              },
-            });
-          } catch {
-            timeline = [];
+          if (options?.includeTimeline !== false) {
+            try {
+              timeline = await loadCodexThreadHistoryTimeline({
+                threadId,
+                cwd,
+                requestThread: (threadIdToRead) => {
+                  return readCodexThread(client, threadIdToRead);
+                },
+              });
+            } catch {
+              timeline = [];
+            }
           }
 
           return {

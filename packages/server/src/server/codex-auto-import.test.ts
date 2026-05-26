@@ -144,6 +144,77 @@ describe("syncCodexPersistedAgents", () => {
     expect(workspaces[0]?.updatedAt).toBe("2026-05-06T19:30:00.000Z");
   });
 
+  test("unarchives project and workspace records when active Codex threads are imported", async () => {
+    workspaceGitService = createNoopWorkspaceGitService({
+      getCheckout: async (cwd: string) => ({
+        cwd,
+        isGit: true,
+        currentBranch: "main",
+        remoteUrl: "git@github.com:acme/project.git",
+        worktreeRoot: cwd,
+        isPaseoOwnedWorktree: false,
+        mainRepoRoot: cwd,
+      }),
+    });
+
+    await projectRegistry.initialize();
+    await workspaceRegistry.initialize();
+    await projectRegistry.upsert({
+      projectId: "remote:github.com/acme/project",
+      rootPath: "F:\\git\\project",
+      kind: "git",
+      displayName: "acme/project",
+      createdAt: "2026-05-06T17:00:00.000Z",
+      updatedAt: "2026-05-06T17:30:00.000Z",
+      archivedAt: "2026-05-06T17:30:00.000Z",
+    });
+    await workspaceRegistry.upsert({
+      workspaceId: normalizeWorkspaceId("F:\\git\\project"),
+      projectId: "remote:github.com/acme/project",
+      cwd: "F:\\git\\project",
+      kind: "local_checkout",
+      displayName: "main",
+      createdAt: "2026-05-06T17:00:00.000Z",
+      updatedAt: "2026-05-06T17:30:00.000Z",
+      archivedAt: "2026-05-06T17:30:00.000Z",
+    });
+
+    const descriptors = [
+      createDescriptor({
+        sessionId: "thread-active",
+        cwd: "F:\\git\\project",
+        title: "Active imported thread",
+        lastActivityAt: new Date("2026-05-06T19:30:00.000Z"),
+      }),
+    ];
+
+    await syncCodexPersistedAgents({
+      agentManager: {
+        listPersistedAgents: async (options) =>
+          options?.includeArchived
+            ? descriptors
+            : descriptors.filter((descriptor) => !descriptor.archivedAt),
+      },
+      agentStorage,
+      projectRegistry,
+      workspaceRegistry,
+      workspaceGitService,
+      logger,
+    });
+
+    const projects = await projectRegistry.list();
+    const workspaces = await workspaceRegistry.list();
+    const project = projects.find(
+      (record) => record.projectId === "remote:github.com/acme/project",
+    );
+    const workspace = workspaces.find(
+      (record) => record.workspaceId === normalizeWorkspaceId("F:\\git\\project"),
+    );
+
+    expect(project?.archivedAt).toBeNull();
+    expect(workspace?.archivedAt).toBeNull();
+  });
+
   test("dedupes already-imported threads by persistence handle and groups git worktrees under one project", async () => {
     workspaceGitService = createNoopWorkspaceGitService({
       getCheckout: async (cwd: string) => ({

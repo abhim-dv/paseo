@@ -568,6 +568,7 @@ export class AgentManager {
       return client.listPersistedAgents({
         limit: options.limit,
         includeArchived: options.includeArchived,
+        includeTimeline: options.includeTimeline,
       });
     }
 
@@ -580,6 +581,7 @@ export class AgentManager {
           return await client.listPersistedAgents!({
             limit: options?.limit,
             includeArchived: options?.includeArchived,
+            includeTimeline: options?.includeTimeline,
           });
         } catch (error) {
           this.logger.warn(

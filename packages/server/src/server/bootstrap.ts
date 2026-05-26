@@ -96,7 +96,7 @@ import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
-import { AgentStorage } from "./agent/agent-storage.js";
+import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { syncCodexPersistedAgents } from "./codex-auto-import.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
@@ -140,6 +140,8 @@ import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import { createRequireBearerMiddleware, type DaemonAuthConfig } from "./auth.js";
 
 type AgentMcpTransportMap = Map<string, StreamableHTTPServerTransport>;
+
+const CODEX_AUTO_IMPORT_POLL_INTERVAL_MS = 30_000;
 
 function formatHostForHttpUrl(host: string): string {
   return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
@@ -220,6 +222,68 @@ export interface PaseoDaemon {
   getListenTarget(): ListenTarget | null;
 }
 
+interface StoredAgentRegistryDiff {
+  upsertAgentIds: string[];
+  removeAgentIds: string[];
+  cwds: string[];
+}
+
+function mapCodexStoredAgents(records: StoredAgentRecord[]): Map<
+  string,
+  {
+    fingerprint: string;
+    cwd: string;
+  }
+> {
+  return new Map(
+    records
+      .filter((record) => record.provider === "codex")
+      .map((record) => [
+        record.id,
+        {
+          fingerprint: JSON.stringify(record),
+          cwd: record.cwd,
+        },
+      ]),
+  );
+}
+
+function diffCodexStoredAgents(
+  before: StoredAgentRecord[],
+  after: StoredAgentRecord[],
+): StoredAgentRegistryDiff {
+  const beforeById = mapCodexStoredAgents(before);
+  const afterById = mapCodexStoredAgents(after);
+  const upsertAgentIds: string[] = [];
+  const removeAgentIds: string[] = [];
+  const cwds = new Set<string>();
+
+  for (const [agentId, afterRecord] of afterById) {
+    const beforeRecord = beforeById.get(agentId);
+    if (!beforeRecord || beforeRecord.fingerprint !== afterRecord.fingerprint) {
+      upsertAgentIds.push(agentId);
+      cwds.add(afterRecord.cwd);
+    }
+  }
+
+  for (const [agentId, beforeRecord] of beforeById) {
+    if (!afterById.has(agentId)) {
+      removeAgentIds.push(agentId);
+      cwds.add(beforeRecord.cwd);
+    }
+  }
+
+  return {
+    upsertAgentIds,
+    removeAgentIds,
+    cwds: Array.from(cwds),
+  };
+}
+
+function hasStoredAgentRegistryDiff(diff: StoredAgentRegistryDiff): boolean {
+  return diff.upsertAgentIds.length > 0 || diff.removeAgentIds.length > 0;
+}
+
 export async function createPaseoDaemon(
   config: PaseoDaemonConfig,
   rootLogger: Logger,
@@ -264,6 +328,8 @@ export async function createPaseoDaemon(
   const scriptRuntimeStore = new WorkspaceScriptRuntimeStore();
   const configuredHostnames = config.hostnames ?? config.allowedHosts;
   let wsServer: VoiceAssistantWebSocketServer | null = null;
+  let codexAutoImportInterval: ReturnType<typeof setInterval> | null = null;
+  let codexAutoImportInFlight: Promise<void> | null = null;
   const scriptHealthMonitor = new ScriptHealthMonitor({
     routeStore: scriptRouteStore,
     onChange: createScriptStatusEmitter({
@@ -479,23 +545,6 @@ export async function createPaseoDaemon(
     logger,
   });
   logger.info({ elapsed: elapsed() }, "Workspace registries bootstrapped");
-  void syncCodexPersistedAgents({
-    agentManager,
-    agentStorage,
-    projectRegistry,
-    workspaceRegistry,
-    workspaceGitService,
-    logger,
-  })
-    .then((autoImportResult) => {
-      return logger.info(
-        { elapsed: elapsed(), ...autoImportResult },
-        "Codex auto-import sync completed",
-      );
-    })
-    .catch((error) => {
-      logger.warn({ err: error, elapsed: elapsed() }, "Codex auto-import sync failed");
-    });
   await chatService.initialize();
   logger.info({ elapsed: elapsed() }, "Chat service initialized");
   const checkoutDiffManager = new CheckoutDiffManager({
@@ -769,6 +818,71 @@ export async function createPaseoDaemon(
   });
   logger.info({ elapsed: elapsed() }, "Speech service created");
 
+  const runCodexAutoImportSync = async () => {
+    const before = await agentStorage.list();
+    const autoImportResult = await syncCodexPersistedAgents({
+      agentManager,
+      agentStorage,
+      projectRegistry,
+      workspaceRegistry,
+      workspaceGitService,
+      logger,
+    });
+    const after = await agentStorage.list();
+    const diff = diffCodexStoredAgents(before, after);
+
+    if (hasStoredAgentRegistryDiff(diff)) {
+      await Promise.all(
+        wsServer
+          ?.listActiveSessions()
+          .map((session) => session.emitStoredAgentUpdatesForExternalMutation(diff)) ?? [],
+      );
+    }
+
+    logger.info(
+      {
+        elapsed: elapsed(),
+        ...autoImportResult,
+        changedAgents: diff.upsertAgentIds.length,
+        removedAgents: diff.removeAgentIds.length,
+      },
+      "Codex auto-import sync completed",
+    );
+  };
+
+  const runCodexAutoImportSyncIfIdle = () => {
+    if (codexAutoImportInFlight) {
+      return;
+    }
+    codexAutoImportInFlight = runCodexAutoImportSync()
+      .catch((error) => {
+        logger.warn({ err: error, elapsed: elapsed() }, "Codex auto-import sync failed");
+      })
+      .finally(() => {
+        codexAutoImportInFlight = null;
+      });
+  };
+
+  const startCodexAutoImportPolling = () => {
+    if (codexAutoImportInterval) {
+      return;
+    }
+    runCodexAutoImportSyncIfIdle();
+    codexAutoImportInterval = setInterval(
+      runCodexAutoImportSyncIfIdle,
+      CODEX_AUTO_IMPORT_POLL_INTERVAL_MS,
+    );
+    codexAutoImportInterval.unref?.();
+  };
+
+  const stopCodexAutoImportPolling = async () => {
+    if (codexAutoImportInterval) {
+      clearInterval(codexAutoImportInterval);
+      codexAutoImportInterval = null;
+    }
+    await codexAutoImportInFlight?.catch(() => undefined);
+  };
+
   logger.info({ elapsed: elapsed() }, "Bootstrap complete, ready to start listening");
 
   const start = async () => {
@@ -861,6 +975,7 @@ export async function createPaseoDaemon(
             workspaceGitService,
             github,
           );
+          startCodexAutoImportPolling();
 
           if (relayEnabled) {
             const offer = await createConnectionOfferV2({
@@ -910,6 +1025,7 @@ export async function createPaseoDaemon(
   };
 
   const stop = async () => {
+    await stopCodexAutoImportPolling();
     scriptHealthMonitor.stop();
     await closeAllAgents(logger, agentManager);
     await agentManager.flush().catch(() => undefined);

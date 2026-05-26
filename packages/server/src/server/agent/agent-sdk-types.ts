@@ -428,6 +428,7 @@ export interface AgentSlashCommand {
 export interface ListPersistedAgentsOptions {
   limit?: number;
   includeArchived?: boolean;
+  includeTimeline?: boolean;
 }
 
 export interface PersistedAgentDescriptor {
