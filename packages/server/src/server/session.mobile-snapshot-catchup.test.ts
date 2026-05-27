@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  shouldForwardMobileAgentStream,
   shouldForceMobileSnapshotTimelineFetch,
   shouldStartMobileSnapshotCatchup,
 } from "./session.js";
@@ -71,6 +72,47 @@ describe("mobile snapshot catch-up policy", () => {
         agentId: "agent-1",
         expiresAtMs: nowMs,
         nowMs,
+      }),
+    ).toBe(false);
+  });
+
+  it("forwards live stream events for a visible mobile timeline target even without focused heartbeat", () => {
+    const nowMs = Date.parse("2026-05-26T12:00:00.000Z");
+
+    expect(
+      shouldForwardMobileAgentStream({
+        activity: activity({ focusedAgentId: null }),
+        agentId: "agent-1",
+        liveStreamUntilMs: nowMs + 1,
+        nowMs,
+        backgroundGraceMs: 60_000,
+      }),
+    ).toBe(true);
+    expect(
+      shouldForwardMobileAgentStream({
+        activity: activity({ focusedAgentId: null }),
+        agentId: "agent-1",
+        liveStreamUntilMs: nowMs,
+        nowMs,
+        backgroundGraceMs: 60_000,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not use the live stream target while mobile is backgrounded", () => {
+    const nowMs = Date.parse("2026-05-26T12:02:00.000Z");
+
+    expect(
+      shouldForwardMobileAgentStream({
+        activity: activity({
+          appVisible: false,
+          focusedAgentId: null,
+          appVisibilityChangedAt: new Date("2026-05-26T12:01:30.000Z"),
+        }),
+        agentId: "agent-1",
+        liveStreamUntilMs: nowMs + 1,
+        nowMs,
+        backgroundGraceMs: 60_000,
       }),
     ).toBe(false);
   });

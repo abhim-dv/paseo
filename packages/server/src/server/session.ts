@@ -540,6 +540,27 @@ export function shouldForceMobileSnapshotTimelineFetch(input: {
   return expiresAtMs !== undefined && expiresAtMs > nowMs;
 }
 
+export function shouldForwardMobileAgentStream(input: {
+  activity: ClientActivitySnapshot | null;
+  agentId: string;
+  liveStreamUntilMs: number | undefined;
+  nowMs: number;
+  backgroundGraceMs: number;
+}): boolean {
+  const { activity, agentId, liveStreamUntilMs, nowMs, backgroundGraceMs } = input;
+  if (!activity || activity.deviceType !== "mobile") {
+    return true;
+  }
+  if (activity.appVisible) {
+    return activity.focusedAgentId === agentId || (liveStreamUntilMs ?? 0) > nowMs;
+  }
+  if (activity.focusedAgentId !== agentId) {
+    return false;
+  }
+  const hiddenForMs = nowMs - activity.appVisibilityChangedAt.getTime();
+  return hiddenForMs < backgroundGraceMs;
+}
+
 interface AgentTimelineFetchPlan {
   forceMobileSnapshot: boolean;
   direction: AgentTimelineFetchDirection;
@@ -856,7 +877,9 @@ export class Session {
   private workspaceUpdatesSubscription: WorkspaceUpdatesSubscriptionState | null = null;
   private clientActivity: ClientActivitySnapshot | null = null;
   private readonly mobileSnapshotCatchupUntilByAgentId = new Map<string, number>();
+  private readonly mobileLiveStreamUntilByAgentId = new Map<string, number>();
   private readonly MOBILE_BACKGROUND_STREAM_GRACE_MS = 60_000;
+  private readonly MOBILE_FOCUSED_LIVE_STREAM_WINDOW_MS = 120_000;
   private readonly MOBILE_SNAPSHOT_CATCHUP_WINDOW_MS = 10_000;
   private readonly terminalManager: TerminalManager | null;
   private readonly providerSnapshotManager: ProviderSnapshotManager | null;
@@ -1380,20 +1403,8 @@ export class Session {
         // Reduce bandwidth/CPU on mobile: only forward high-frequency agent stream events
         // for the focused agent, with a short grace window while backgrounded.
         // History catch-up is handled via pull-based `fetch_agent_timeline_request`.
-        const activity = this.clientActivity;
-        if (activity?.deviceType === "mobile") {
-          if (!activity.focusedAgentId) {
-            return;
-          }
-          if (activity.focusedAgentId !== event.agentId) {
-            return;
-          }
-          if (!activity.appVisible) {
-            const hiddenForMs = Date.now() - activity.appVisibilityChangedAt.getTime();
-            if (hiddenForMs >= this.MOBILE_BACKGROUND_STREAM_GRACE_MS) {
-              return;
-            }
-          }
+        if (!this.shouldForwardAgentStreamToClient(event.agentId)) {
+          return;
         }
 
         const serializedEvent = serializeAgentStreamEvent(event.event);
@@ -4428,6 +4439,9 @@ export class Session {
         Date.now() + this.MOBILE_SNAPSHOT_CATCHUP_WINDOW_MS,
       );
     }
+    if (next.deviceType === "mobile" && next.appVisible && next.focusedAgentId) {
+      this.markMobileLiveStreamTarget(next.focusedAgentId);
+    }
   }
 
   /**
@@ -6543,6 +6557,29 @@ export class Session {
     return shouldForce;
   }
 
+  private markMobileLiveStreamTarget(agentId: string): void {
+    this.mobileLiveStreamUntilByAgentId.set(
+      agentId,
+      Date.now() + this.MOBILE_FOCUSED_LIVE_STREAM_WINDOW_MS,
+    );
+  }
+
+  private shouldForwardAgentStreamToClient(agentId: string): boolean {
+    const liveStreamUntilMs = this.mobileLiveStreamUntilByAgentId.get(agentId);
+    const nowMs = Date.now();
+    const shouldForward = shouldForwardMobileAgentStream({
+      activity: this.clientActivity,
+      agentId,
+      liveStreamUntilMs,
+      nowMs,
+      backgroundGraceMs: this.MOBILE_BACKGROUND_STREAM_GRACE_MS,
+    });
+    if (liveStreamUntilMs !== undefined && liveStreamUntilMs <= nowMs) {
+      this.mobileLiveStreamUntilByAgentId.delete(agentId);
+    }
+    return shouldForward;
+  }
+
   private resolveAgentTimelineFetchPlan(
     msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
   ): AgentTimelineFetchPlan {
@@ -7330,6 +7367,9 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
   ): Promise<void> {
     const plan = this.resolveAgentTimelineFetchPlan(msg);
+    if (this.clientActivity?.deviceType === "mobile" && this.clientActivity.appVisible) {
+      this.markMobileLiveStreamTarget(msg.agentId);
+    }
     const { direction, projection, requestedLimit, limit, shouldLimitByProjectedWindow, cursor } =
       plan;
 
